@@ -1,0 +1,13 @@
+{
+  "name": "vibeperks",
+  "owner": {
+    "name": "VibePerks"
+  },
+  "plugins": [
+    {
+      "name": "vibeperks",
+      "source": "./",
+      "description": "VibePerks for Claude Code: a quiet one-line sponsor in your status line that earns you credit while you code. Only display facts (never your code or prompts) are reported."
+    }
+  ]
+}

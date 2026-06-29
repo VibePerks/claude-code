@@ -1,0 +1,52 @@
+name: Publish prebuilt binaries
+
+# Cross-compiles the distribution binaries and commits them into bin/ so installs
+# work without Go. This workflow lives at the root of the public VibePerks/claude-code
+# repo, into which plugin/claude-code/ is mirrored by the monorepo's
+# scripts/git-push-main.ps1. It is dormant inside the monorepo (only root-level
+# .github/workflows run there); the private monorepo never holds binaries.
+on:
+  # Dispatch-only: triggered by the monorepo CI/CD release-plugins job after
+  # every test gate passes. Auto-trigger on push removed so an untested mirror
+  # push can never publish binaries.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Bump patch version
+        run: |
+          set -eu
+          f=.claude-plugin/plugin.json
+          ver=$(jq -r .version "$f"); IFS=. read -r a b c <<EOF
+          $ver
+          EOF
+          new="$a.$b.$((c+1))"
+          jq --arg v "$new" '.version=$v' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+          echo "bumped to $new"
+
+      - name: Cross-compile distribution binaries
+        run: DIST=1 sh ./build.sh
+
+      - name: Commit prebuilt binaries
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add bin .claude-plugin/plugin.json
+          git update-index --chmod=+x bin/vibeperks
+          if git diff --cached --quiet; then
+            echo "No binary changes to commit."
+          else
+            git commit -m 'ci: publish prebuilt vibeperks binaries [skip ci]'
+            git push origin HEAD:main
+          fi

@@ -1,0 +1,29 @@
+#!/bin/sh
+# VibePerks launcher invoked by the Claude Code hooks. A marketplace install ships
+# source + this script (no host binary), so we resolve a runnable binary at first use:
+#   1) a built/cached binary (bin/vibeperks.real)
+#   2) a prebuilt distribution binary for this platform (bin/vibeperks-<os>-<arch>)
+#   3) build from src/ if Go is available (cached as bin/vibeperks.real)
+# Failures stay quiet so the host CLI is never broken.
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+bin="$root/bin"
+real="$bin/vibeperks.real"
+
+if [ -x "$real" ]; then exec "$real" "$@"; fi
+
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m)
+case "$arch" in x86_64|amd64) arch=amd64;; aarch64|arm64) arch=arm64;; esac
+case "$os" in darwin) os=darwin;; linux) os=linux;; mingw*|msys*|cygwin*) os=windows;; esac
+
+pre="$bin/vibeperks-$os-$arch"
+[ "$os" = windows ] && pre="$pre.exe"
+if [ -x "$pre" ]; then exec "$pre" "$@"; fi
+
+if command -v go >/dev/null 2>&1; then
+  ( cd "$root" && DIST=0 sh ./build.sh >/dev/null 2>&1 ) || exit 0
+  [ -x "$real" ] && exec "$real" "$@"
+fi
+exit 0
