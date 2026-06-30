@@ -2,9 +2,6 @@
   "name": "vibeperks",
   "version": "0.1.8",
   "description": "VibePerks for Claude Code: a quiet one-line sponsor in your status line that earns you credit while you code. No code, prompts, or file contents ever leave your machine.",
-  "author": {
-    "name": "VibePerks",
-    "email": "contact@vibeperks.ai"
-  },
+  "author": { "name": "VibePerks", "email": "contact@vibeperks.ai" },
   "license": "PolyForm-Shield-1.0.0"
 }
