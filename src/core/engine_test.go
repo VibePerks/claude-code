@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -251,13 +252,46 @@ func TestRefreshServeErrorPropagatesAndKeepsImpression(t *testing.T) {
 	}
 }
 
+func TestRefreshUnauthorizedFlagsNeedsLogin(t *testing.T) {
+	dir := t.TempDir()
+	_ = SaveState(dir, State{
+		Ad:            &Ad{AdID: "a", ImpressionToken: "tokA"},
+		ServedAt:      100,
+		FirstRenderAt: 101,
+		LastRenderAt:  110,
+	})
+	// serve returns 401: the device token was rejected.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	err := Refresh(context.Background(), dir, clientFor(srv.URL), newMeta(), 130, true)
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected ErrUnauthorized, got %v", err)
+	}
+	s, _ := LoadState(dir)
+	if !s.NeedsLogin {
+		t.Error("NeedsLogin should be set after a rejected token")
+	}
+	if s.NeedsLoginReason != "device token invalid or revoked" {
+		t.Errorf("NeedsLoginReason = %q", s.NeedsLoginReason)
+	}
+	if s.Ad != nil {
+		t.Errorf("cached ad should be cleared, got %+v", s.Ad)
+	}
+}
+
 func TestRenderSetsTimestampsAndReturnsLine(t *testing.T) {
 	dir := t.TempDir()
 	_ = SaveState(dir, State{Ad: &Ad{Sentence: "hello", Domain: "foo.com", ImpressionToken: "t"}, ServedAt: 100})
 
-	line, err := Render(dir, 105)
+	line, notice, err := Render(dir, 105, "vibeperks login")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if notice {
+		t.Error("ad render should not be a notice")
 	}
 	if line != "hello - foo.com" {
 		t.Errorf("line = %q", line)
@@ -267,7 +301,7 @@ func TestRenderSetsTimestampsAndReturnsLine(t *testing.T) {
 		t.Errorf("render timestamps wrong: %+v", s)
 	}
 	// second render keeps first, updates last
-	if _, err := Render(dir, 112); err != nil {
+	if _, _, err := Render(dir, 112, "vibeperks login"); err != nil {
 		t.Fatal(err)
 	}
 	s, _ = LoadState(dir)
@@ -277,9 +311,25 @@ func TestRenderSetsTimestampsAndReturnsLine(t *testing.T) {
 }
 
 func TestRenderNoAd(t *testing.T) {
-	line, err := Render(t.TempDir(), 100)
-	if err != nil || line != "" {
-		t.Fatalf("no ad: line=%q err=%v", line, err)
+	line, notice, err := Render(t.TempDir(), 100, "vibeperks login")
+	if err != nil || line != "" || notice {
+		t.Fatalf("no ad: line=%q notice=%v err=%v", line, notice, err)
+	}
+}
+
+func TestRenderNeedsLoginReturnsNotice(t *testing.T) {
+	dir := t.TempDir()
+	_ = SaveState(dir, State{NeedsLogin: true})
+
+	line, notice, err := Render(dir, 100, "vibeperks login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !notice {
+		t.Error("NeedsLogin state should render a notice")
+	}
+	if line != LoginNotice("vibeperks login", "") {
+		t.Errorf("line = %q", line)
 	}
 }
 

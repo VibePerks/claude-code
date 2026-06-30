@@ -82,11 +82,11 @@ func cmdStatus(dir string) error {
 	raw, _ := io.ReadAll(os.Stdin)
 	var in core.StatusInput
 	_ = json.Unmarshal(raw, &in)
-	adLine, err := core.Render(dir, time.Now().Unix())
+	adLine, notice, err := core.Render(dir, time.Now().Unix(), "vibeperks login")
 	if err != nil {
 		return err
 	}
-	fmt.Print(core.StatusLine(in, adLine, terminalCols()))
+	fmt.Print(core.StatusLine(in, adLine, notice, terminalCols()))
 	return nil
 }
 

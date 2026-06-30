@@ -1,6 +1,9 @@
 package core
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // Meta is the per-session adapter metadata attached to every impression.
 type Meta struct {
@@ -81,6 +84,13 @@ func Refresh(ctx context.Context, dir string, c *Client, meta Meta, now int64, f
 	}
 	ad, err := c.Serve(ctx)
 	if err != nil {
+		// A rejected device token means no amount of retrying helps: clear the cached
+		// ad and flag the slot (with the reason) so the surface shows a sign-in notice.
+		if errors.Is(err, ErrUnauthorized) {
+			_ = SaveState(dir, State{NeedsLogin: true, NeedsLoginReason: UnauthorizedReason(err)})
+			_ = Flush(ctx, dir, c)
+			return err
+		}
 		// Keep the buffered impression and the recorded flag; surface the serve error
 		// (the plugin boundary swallows it so the host CLI is unaffected).
 		_ = SaveState(dir, s)
@@ -103,23 +113,28 @@ func Refresh(ctx context.Context, dir string, c *Client, meta Meta, now int64, f
 }
 
 // Render marks the cached ad as displayed at time now (setting first/last render
-// timestamps) and returns its one-line form. Returns "" when there is no cached ad.
-func Render(dir string, now int64) (string, error) {
+// timestamps) and returns its one-line form. When the device token was rejected it
+// returns a sign-in notice (built from loginCmd) and needsLogin=true instead. Returns
+// "" when there is no cached ad and no pending login.
+func Render(dir string, now int64, loginCmd string) (string, bool, error) {
 	s, err := LoadState(dir)
 	if err != nil {
-		return "", err
+		return "", false, err
+	}
+	if s.NeedsLogin {
+		return LoginNotice(loginCmd, s.NeedsLoginReason), true, nil
 	}
 	if s.Ad == nil {
-		return "", nil
+		return "", false, nil
 	}
 	if s.FirstRenderAt == 0 {
 		s.FirstRenderAt = now
 	}
 	s.LastRenderAt = now
 	if err := SaveState(dir, s); err != nil {
-		return "", err
+		return "", false, err
 	}
-	return RenderLine(s.Ad, 0), nil
+	return RenderLine(s.Ad, 0), false, nil
 }
 
 // EndSession is the thinking-end worker: it records the current ad's impression (if

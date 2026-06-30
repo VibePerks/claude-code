@@ -15,6 +15,35 @@ import (
 // prompt the user to re-link the device; retrying with the same token will not help.
 var ErrUnauthorized = errors.New("device token unauthorized")
 
+// AuthRejection wraps ErrUnauthorized with a short, user-facing reason explaining why
+// the device token was rejected, so surfaces can tell the user what went wrong. It
+// satisfies errors.Is(err, ErrUnauthorized) so existing auth checks keep working.
+type AuthRejection struct{ Reason string }
+
+func (e *AuthRejection) Error() string { return "device token unauthorized: " + e.Reason }
+
+func (e *AuthRejection) Is(target error) bool { return target == ErrUnauthorized }
+
+// authReason maps a rejection status to the user-facing reason. The backend returns
+// 403 only for a suspended account and 401 for an invalid/revoked/unknown token, so
+// the status alone is an accurate, non-guessing reason.
+func authReason(status int) string {
+	if status == http.StatusForbidden {
+		return "account suspended"
+	}
+	return "device token invalid or revoked"
+}
+
+// UnauthorizedReason extracts the user-facing reason from an auth-rejection error,
+// returning "" when the error carries none.
+func UnauthorizedReason(err error) string {
+	var ar *AuthRejection
+	if errors.As(err, &ar) {
+		return ar.Reason
+	}
+	return ""
+}
+
 // ErrRejected means the backend permanently refused an impression (a 4xx other than
 // auth, e.g. an expired or malformed token). Such impressions are dropped, not retried.
 var ErrRejected = errors.New("impression rejected")
@@ -62,7 +91,7 @@ func (c *Client) Serve(ctx context.Context) (*Ad, error) {
 		ad.Domain = SanitizeAd(ad.Domain)
 		return &ad, nil
 	case http.StatusUnauthorized, http.StatusForbidden:
-		return nil, ErrUnauthorized
+		return nil, &AuthRejection{Reason: authReason(resp.StatusCode)}
 	default:
 		return nil, fmt.Errorf("serve: unexpected status %d: %s", resp.StatusCode, readSnippet(resp.Body))
 	}
@@ -91,7 +120,7 @@ func (c *Client) PostImpression(ctx context.Context, imp Impression) error {
 	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
 		return nil
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return ErrUnauthorized
+		return &AuthRejection{Reason: authReason(resp.StatusCode)}
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
 		return ErrRejected
 	default:

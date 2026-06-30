@@ -60,3 +60,27 @@ func TestRenderLineColsOne(t *testing.T) {
 		t.Errorf("got %q, want a", got)
 	}
 }
+
+func TestLoginNoticeIncludesCommand(t *testing.T) {
+	got := LoginNotice("vibeperks login", "")
+	if !strings.Contains(got, "VibePerks") || !strings.Contains(got, "vibeperks login") {
+		t.Errorf("notice = %q", got)
+	}
+}
+
+func TestLoginNoticeIncludesReason(t *testing.T) {
+	got := LoginNotice("vibeperks login", "account suspended")
+	if !strings.Contains(got, "account suspended") || !strings.Contains(got, "vibeperks login") {
+		t.Errorf("notice = %q", got)
+	}
+}
+
+func TestLoginNoticeOmitsEmptyCommand(t *testing.T) {
+	got := LoginNotice("", "device token invalid or revoked")
+	if strings.Contains(got, "run:") {
+		t.Errorf("empty command should omit run hint, got %q", got)
+	}
+	if !strings.Contains(got, "device token invalid or revoked") {
+		t.Errorf("notice should keep the reason, got %q", got)
+	}
+}

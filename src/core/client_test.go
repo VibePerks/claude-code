@@ -49,7 +49,11 @@ func TestServeNoContentReturnsNil(t *testing.T) {
 }
 
 func TestServeUnauthorized(t *testing.T) {
-	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+	cases := map[int]string{
+		http.StatusUnauthorized: "device token invalid or revoked",
+		http.StatusForbidden:    "account suspended",
+	}
+	for code, wantReason := range cases {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(code)
 		}))
@@ -57,6 +61,9 @@ func TestServeUnauthorized(t *testing.T) {
 		srv.Close()
 		if !errors.Is(err, ErrUnauthorized) {
 			t.Errorf("status %d: err = %v, want ErrUnauthorized", code, err)
+		}
+		if got := UnauthorizedReason(err); got != wantReason {
+			t.Errorf("status %d: reason = %q, want %q", code, got, wantReason)
 		}
 	}
 }
