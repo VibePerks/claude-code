@@ -1,0 +1,475 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// engineMock serves a configurable ad and accepts impressions, counting both.
+type engineMock struct {
+	srv        *httptest.Server
+	serveCalls atomic.Int64
+	impCalls   atomic.Int64
+	serveAd    *Ad    // nil => 204 (unless serveCap is set)
+	serveCap   string // when non-empty, serve returns earning_capped with this try_again_at
+}
+
+func newEngineMock(ad *Ad) *engineMock {
+	m := &engineMock{serveAd: ad}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/ads/serve", func(w http.ResponseWriter, r *http.Request) {
+		m.serveCalls.Add(1)
+		if m.serveCap != "" {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status":       "earning_capped",
+				"ad_id":        nil,
+				"try_again_at": m.serveCap,
+			})
+			return
+		}
+		if m.serveAd == nil {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writeJSON(w, http.StatusOK, m.serveAd)
+	})
+	mux.HandleFunc("/v1/impressions", func(w http.ResponseWriter, r *http.Request) {
+		m.impCalls.Add(1)
+		w.WriteHeader(http.StatusCreated)
+	})
+	m.srv = httptest.NewServer(mux)
+	return m
+}
+
+func (m *engineMock) client() *Client { return clientFor(m.srv.URL) }
+func (m *engineMock) close()          { m.srv.Close() }
+
+func newMeta() Meta {
+	return Meta{CLI: "claude-code", CLIVersion: "1.0", PluginVersion: "test", SessionID: "sess-1"}
+}
+
+func TestRefreshOptOutClearsStateNoNetwork(t *testing.T) {
+	dir := t.TempDir()
+	if err := SaveConfig(dir, Config{OptOut: true}); err != nil {
+		t.Fatal(err)
+	}
+	_ = SaveState(dir, State{Ad: &Ad{AdID: "old"}, ServedAt: 1})
+	m := newEngineMock(&Ad{AdID: "new"})
+	defer m.close()
+
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100, true); err != nil {
+		t.Fatal(err)
+	}
+	if m.serveCalls.Load() != 0 || m.impCalls.Load() != 0 {
+		t.Errorf("opt-out must do no network: serve=%d imp=%d", m.serveCalls.Load(), m.impCalls.Load())
+	}
+	s, _ := LoadState(dir)
+	if s.Ad != nil {
+		t.Errorf("opt-out should clear cached ad, got %+v", s.Ad)
+	}
+}
+
+func TestRefreshForceServesAndCaches(t *testing.T) {
+	dir := t.TempDir()
+	ad := &Ad{AdID: "a1", Sentence: "s", ImpressionToken: "tok1", RotateSeconds: 20}
+	m := newEngineMock(ad)
+	defer m.close()
+
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100, true); err != nil {
+		t.Fatal(err)
+	}
+	if m.serveCalls.Load() != 1 {
+		t.Errorf("serve calls = %d, want 1", m.serveCalls.Load())
+	}
+	s, _ := LoadState(dir)
+	if s.Ad == nil || s.Ad.AdID != "a1" || s.ServedAt != 100 || s.FirstRenderAt != 0 {
+		t.Errorf("ad not cached fresh: %+v", s)
+	}
+}
+
+func TestRefreshForce204ClearsAd(t *testing.T) {
+	dir := t.TempDir()
+	_ = SaveState(dir, State{Ad: &Ad{AdID: "old"}, ServedAt: 1})
+	m := newEngineMock(nil) // empty inventory
+	defer m.close()
+
+	// Past the 5-minute billable window so a serve is due.
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 400, true); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := LoadState(dir)
+	if s.Ad != nil {
+		t.Errorf("empty inventory should clear the slot, got %+v", s.Ad)
+	}
+}
+
+func TestRefreshNotDueDoesNotServe(t *testing.T) {
+	dir := t.TempDir()
+	_ = SaveState(dir, State{Ad: &Ad{AdID: "a", RotateSeconds: 20}, ServedAt: 100, FirstRenderAt: 100, LastRenderAt: 100})
+	m := newEngineMock(&Ad{AdID: "b"})
+	defer m.close()
+
+	// now only 5s after serve, no force => not due
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 105, false); err != nil {
+		t.Fatal(err)
+	}
+	if m.serveCalls.Load() != 0 {
+		t.Errorf("should not serve when not due: serve=%d", m.serveCalls.Load())
+	}
+	s, _ := LoadState(dir)
+	if s.Ad.AdID != "a" {
+		t.Errorf("cached ad should be unchanged, got %s", s.Ad.AdID)
+	}
+}
+
+func TestRefreshRotatesAfterBillableWindow(t *testing.T) {
+	dir := t.TempDir()
+	_ = SaveState(dir, State{
+		Ad:            &Ad{AdID: "a", ImpressionToken: "tokA", RotateSeconds: 20},
+		ServedAt:      100,
+		FirstRenderAt: 101,
+		LastRenderAt:  118,
+	})
+	m := newEngineMock(&Ad{AdID: "b", ImpressionToken: "tokB", RotateSeconds: 20})
+	defer m.close()
+
+	// 5+ minutes after serve, rendered => due (a new billable serve).
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100+billableIntervalSeconds+10, false); err != nil {
+		t.Fatal(err)
+	}
+	if m.serveCalls.Load() != 1 {
+		t.Errorf("serve calls = %d, want 1 (rotation)", m.serveCalls.Load())
+	}
+	if m.impCalls.Load() != 1 {
+		t.Errorf("previous ad impression should be reported: imp=%d", m.impCalls.Load())
+	}
+	s, _ := LoadState(dir)
+	if s.Ad.AdID != "b" {
+		t.Errorf("rotated ad should be b, got %s", s.Ad.AdID)
+	}
+	if got, _ := readQueue(dir); len(got) != 0 {
+		t.Errorf("impression should have flushed, queue=%+v", got)
+	}
+}
+
+func TestRefreshEarningCappedBacksOff(t *testing.T) {
+	dir := t.TempDir()
+	resetAt := time.Unix(100+billableIntervalSeconds, 0).UTC().Format(time.RFC3339)
+	m := newEngineMock(&Ad{AdID: "b", ImpressionToken: "tokB"})
+	m.serveCap = resetAt // the next serve reports the publisher is earning-capped
+	defer m.close()
+
+	// First serve returns earning_capped: no ad, cache the reset time.
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100, true); err != nil {
+		t.Fatal(err)
+	}
+	if m.serveCalls.Load() != 1 {
+		t.Errorf("serve calls = %d, want 1", m.serveCalls.Load())
+	}
+	s, _ := LoadState(dir)
+	if s.Ad != nil || s.TryAgainAt != resetAt {
+		t.Errorf("capped state wrong: ad=%+v tryAgainAt=%q", s.Ad, s.TryAgainAt)
+	}
+
+	// While within the backoff window, Refresh must NOT call serve again.
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 150, true); err != nil {
+		t.Fatal(err)
+	}
+	if m.serveCalls.Load() != 1 {
+		t.Errorf("must not serve during backoff, serve calls = %d", m.serveCalls.Load())
+	}
+
+	// After the reset time, serving resumes and the cap clears.
+	m.serveCap = ""
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100+billableIntervalSeconds+5, true); err != nil {
+		t.Fatal(err)
+	}
+	if m.serveCalls.Load() != 2 {
+		t.Errorf("serve should resume after reset, serve calls = %d", m.serveCalls.Load())
+	}
+	s, _ = LoadState(dir)
+	if s.Ad == nil || s.Ad.AdID != "b" || s.TryAgainAt != "" {
+		t.Errorf("cap should clear and serve b, got ad=%+v tryAgainAt=%q", s.Ad, s.TryAgainAt)
+	}
+}
+
+func TestRefreshUnrenderedAdSkipsImpression(t *testing.T) {
+	dir := t.TempDir()
+	// previous ad was never rendered (FirstRenderAt == 0)
+	_ = SaveState(dir, State{Ad: &Ad{AdID: "a", ImpressionToken: "tokA"}, ServedAt: 100})
+	m := newEngineMock(&Ad{AdID: "b", ImpressionToken: "tokB"})
+	defer m.close()
+
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100+billableIntervalSeconds+10, true); err != nil {
+		t.Fatal(err)
+	}
+	if m.impCalls.Load() != 0 {
+		t.Errorf("unrendered ad must not produce an impression: imp=%d", m.impCalls.Load())
+	}
+}
+
+func TestRefreshServeErrorPropagatesAndKeepsImpression(t *testing.T) {
+	dir := t.TempDir()
+	_ = SaveState(dir, State{
+		Ad:            &Ad{AdID: "a", ImpressionToken: "tokA"},
+		ServedAt:      100,
+		FirstRenderAt: 101,
+		LastRenderAt:  110,
+	})
+	// serve returns 500; impressions endpoint also 500 so the buffered impression stays
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	err := Refresh(context.Background(), dir, clientFor(srv.URL), newMeta(), 100+billableIntervalSeconds+10, true)
+	if err == nil {
+		t.Fatal("serve error should propagate")
+	}
+	got, _ := readQueue(dir)
+	if len(got) != 1 || got[0].ImpressionToken != "tokA" {
+		t.Errorf("previous impression should be buffered, queue=%+v", got)
+	}
+}
+
+func TestRefreshUnauthorizedFlagsNeedsLogin(t *testing.T) {
+	dir := t.TempDir()
+	_ = SaveState(dir, State{
+		Ad:            &Ad{AdID: "a", ImpressionToken: "tokA"},
+		ServedAt:      100,
+		FirstRenderAt: 101,
+		LastRenderAt:  110,
+	})
+	// serve returns 401: the device token was rejected.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	err := Refresh(context.Background(), dir, clientFor(srv.URL), newMeta(), 100+billableIntervalSeconds+10, true)
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected ErrUnauthorized, got %v", err)
+	}
+	s, _ := LoadState(dir)
+	if !s.NeedsLogin {
+		t.Error("NeedsLogin should be set after a rejected token")
+	}
+	if s.NeedsLoginReason != "device token invalid or revoked" {
+		t.Errorf("NeedsLoginReason = %q", s.NeedsLoginReason)
+	}
+	if s.Ad != nil {
+		t.Errorf("cached ad should be cleared, got %+v", s.Ad)
+	}
+}
+
+func TestRenderSetsTimestampsAndReturnsLine(t *testing.T) {
+	dir := t.TempDir()
+	_ = SaveState(dir, State{Ad: &Ad{Sentence: "hello", Domain: "foo.com", WebsiteURL: "https://foo.com/deals?utm=1", ImpressionToken: "t"}, ServedAt: 100})
+
+	line, domain, websiteURL, notice, err := Render(dir, 105, "vibeperks login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notice {
+		t.Error("ad render should not be a notice")
+	}
+	if line != "foo.com - hello" {
+		t.Errorf("line = %q", line)
+	}
+	if domain != "foo.com" {
+		t.Errorf("domain = %q", domain)
+	}
+	if websiteURL != "https://foo.com/deals?utm=1" {
+		t.Errorf("websiteURL = %q", websiteURL)
+	}
+	s, _ := LoadState(dir)
+	if s.FirstRenderAt != 105 || s.LastRenderAt != 105 {
+		t.Errorf("render timestamps wrong: %+v", s)
+	}
+	// second render keeps first, updates last
+	if _, _, _, _, err := Render(dir, 112, "vibeperks login"); err != nil {
+		t.Fatal(err)
+	}
+	s, _ = LoadState(dir)
+	if s.FirstRenderAt != 105 || s.LastRenderAt != 112 {
+		t.Errorf("second render timestamps wrong: %+v", s)
+	}
+}
+
+func TestRenderNoAd(t *testing.T) {
+	line, domain, websiteURL, notice, err := Render(t.TempDir(), 100, "vibeperks login")
+	if err != nil || line != "" || domain != "" || websiteURL != "" || notice {
+		t.Fatalf("no ad: line=%q domain=%q websiteURL=%q notice=%v err=%v", line, domain, websiteURL, notice, err)
+	}
+}
+
+func TestRenderEarningCappedShowsNotice(t *testing.T) {
+	dir := t.TempDir()
+	resetAt := time.Unix(500, 0).UTC().Format(time.RFC3339)
+	_ = SaveState(dir, State{TryAgainAt: resetAt})
+
+	// Before the reset time: a subtle paused notice (not a login notice, no ad).
+	line, domain, websiteURL, notice, err := Render(dir, 100, "vibeperks login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line != earnCapNotice || notice || domain != "" || websiteURL != "" {
+		t.Errorf("capped render wrong: line=%q notice=%v domain=%q url=%q", line, notice, domain, websiteURL)
+	}
+
+	// After the reset time: no notice, nothing shown (the cap has lapsed).
+	if line, _, _, _, _ := Render(dir, 501, "vibeperks login"); line != "" {
+		t.Errorf("lapsed cap should render nothing, got %q", line)
+	}
+}
+
+func TestRenderNeedsLoginReturnsNotice(t *testing.T) {
+	dir := t.TempDir()
+	_ = SaveState(dir, State{NeedsLogin: true})
+
+	line, _, _, notice, err := Render(dir, 100, "vibeperks login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !notice {
+		t.Error("NeedsLogin state should render a notice")
+	}
+	if line != LoginNotice("vibeperks login", "") {
+		t.Errorf("line = %q", line)
+	}
+}
+
+func TestEndSessionRecordsAndFlushes(t *testing.T) {
+	dir := t.TempDir()
+	_ = SaveState(dir, State{
+		Ad:            &Ad{AdID: "a", ImpressionToken: "tokA"},
+		ServedAt:      100,
+		FirstRenderAt: 102,
+		LastRenderAt:  120,
+	})
+	m := newEngineMock(nil)
+	defer m.close()
+
+	if err := EndSession(context.Background(), dir, m.client(), newMeta(), 121); err != nil {
+		t.Fatal(err)
+	}
+	if m.impCalls.Load() != 1 {
+		t.Errorf("impression calls = %d, want 1", m.impCalls.Load())
+	}
+	s, _ := LoadState(dir)
+	if !s.Recorded {
+		t.Error("ad should be marked recorded")
+	}
+	if got, _ := readQueue(dir); len(got) != 0 {
+		t.Errorf("queue should be flushed: %+v", got)
+	}
+}
+
+func TestEndSessionRecordsImpressionOnlyOnce(t *testing.T) {
+	dir := t.TempDir()
+	_ = SaveState(dir, State{
+		Ad:            &Ad{AdID: "a", ImpressionToken: "tokA"},
+		ServedAt:      100,
+		FirstRenderAt: 102,
+		LastRenderAt:  120,
+	})
+	m := newEngineMock(nil)
+	defer m.close()
+
+	for i := 0; i < 3; i++ {
+		if err := EndSession(context.Background(), dir, m.client(), newMeta(), 121); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if m.impCalls.Load() != 1 {
+		t.Errorf("impression must be reported once, got %d", m.impCalls.Load())
+	}
+}
+
+func TestRotateSecondsDefault(t *testing.T) {
+	if rotateSeconds(nil) != defaultRotateSeconds {
+		t.Errorf("nil ad => %d, want default", rotateSeconds(nil))
+	}
+	if rotateSeconds(&Ad{RotateSeconds: 0}) != defaultRotateSeconds {
+		t.Errorf("zero rotate => %d, want default", rotateSeconds(&Ad{}))
+	}
+	if rotateSeconds(&Ad{RotateSeconds: 45}) != 45 {
+		t.Errorf("explicit rotate not honored")
+	}
+}
+
+func TestEndSessionNoAdNoop(t *testing.T) {
+	dir := t.TempDir()
+	m := newEngineMock(nil)
+	defer m.close()
+	if err := EndSession(context.Background(), dir, m.client(), newMeta(), 100); err != nil {
+		t.Fatal(err)
+	}
+	if m.impCalls.Load() != 0 {
+		t.Errorf("no ad => no impression, got %d", m.impCalls.Load())
+	}
+}
+
+func TestRefreshNotDueFlushesPendingQueue(t *testing.T) {
+	dir := t.TempDir()
+	_ = SaveState(dir, State{Ad: &Ad{AdID: "a", RotateSeconds: 20}, ServedAt: 100, FirstRenderAt: 100, LastRenderAt: 100})
+	_ = Enqueue(dir, Impression{ImpressionToken: "pending"})
+	m := newEngineMock(&Ad{AdID: "b"})
+	defer m.close()
+
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 105, false); err != nil {
+		t.Fatal(err)
+	}
+	if m.serveCalls.Load() != 0 {
+		t.Errorf("not due should not serve, got %d", m.serveCalls.Load())
+	}
+	if m.impCalls.Load() != 1 {
+		t.Errorf("pending impression should still flush, got %d", m.impCalls.Load())
+	}
+}
+
+func TestEndSessionOptOutNoop(t *testing.T) {
+	dir := t.TempDir()
+	_ = SaveConfig(dir, Config{OptOut: true})
+	_ = SaveState(dir, State{Ad: &Ad{ImpressionToken: "t"}, FirstRenderAt: 1, LastRenderAt: 2})
+	m := newEngineMock(nil)
+	defer m.close()
+
+	if err := EndSession(context.Background(), dir, m.client(), newMeta(), 100); err != nil {
+		t.Fatal(err)
+	}
+	if m.impCalls.Load() != 0 {
+		t.Errorf("opt-out should report nothing, imp=%d", m.impCalls.Load())
+	}
+}
+
+func TestRecordCurrentComputesDisplayedMs(t *testing.T) {
+	dir := t.TempDir()
+	s := State{
+		Ad:            &Ad{ImpressionToken: "tok"},
+		ServedAt:      100,
+		FirstRenderAt: 102,
+		LastRenderAt:  120,
+	}
+	if err := recordCurrent(dir, &s, newMeta(), 121); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := readQueue(dir)
+	if len(q) != 1 {
+		t.Fatalf("expected 1 buffered impression, got %d", len(q))
+	}
+	if q[0].DisplayedMs != (121-102)*1000 {
+		t.Errorf("displayed_ms = %d, want %d", q[0].DisplayedMs, (121-102)*1000)
+	}
+	if q[0].SessionDurationMs != (121-100)*1000 {
+		t.Errorf("session_duration_ms = %d", q[0].SessionDurationMs)
+	}
+	if !s.Recorded {
+		t.Error("state should be marked recorded")
+	}
+}
