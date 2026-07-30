@@ -1,0 +1,4 @@
+# Local `go build ./...` output. The runnable binary is downloaded from the GitHub
+# Release (or built on first use) by the bin/ launcher - never commit build artifacts.
+/vibeperks
+/vibeperks.exe

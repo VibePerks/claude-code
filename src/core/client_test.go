@@ -1,0 +1,204 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestServeOKReturnsSanitizedAd(t *testing.T) {
+	var gotToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotToken = r.Header.Get("X-Device-Token")
+		writeJSON(w, http.StatusOK, Ad{
+			AdID:            "ad1",
+			Sentence:        "Fast\tAPIs at foo.com\n",
+			Domain:          "foo.com",
+			WebsiteURL:      "https://foo.com/deals?utm=1\n",
+			ImpressionToken: "imp-tok",
+			RotateSeconds:   25,
+		})
+	}))
+	defer srv.Close()
+
+	res, err := clientFor(srv.URL).Serve(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotToken != "dev-token" {
+		t.Errorf("device token header = %q", gotToken)
+	}
+	if res == nil || res.Ad == nil {
+		t.Fatalf("expected an ad result, got %+v", res)
+	}
+	ad := res.Ad
+	if ad.Sentence != "FastAPIs at foo.com" {
+		t.Errorf("sentence not sanitized: %q", ad.Sentence)
+	}
+	if ad.WebsiteURL != "https://foo.com/deals?utm=1" {
+		t.Errorf("website_url not sanitized: %q", ad.WebsiteURL)
+	}
+	if ad.ImpressionToken != "imp-tok" || ad.RotateSeconds != 25 {
+		t.Errorf("ad decoded wrong: %+v", ad)
+	}
+}
+
+func TestServeEarningCappedReturnsTryAgainAt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":       "earning_capped",
+			"ad_id":        nil,
+			"try_again_at": "2026-07-21T15:00:00Z",
+		})
+	}))
+	defer srv.Close()
+
+	res, err := clientFor(srv.URL).Serve(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res == nil || res.Ad != nil || res.TryAgainAt != "2026-07-21T15:00:00Z" {
+		t.Fatalf("expected earning-capped result, got %+v", res)
+	}
+}
+
+func TestServeNoContentReturnsNil(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	res, err := clientFor(srv.URL).Serve(context.Background())
+	if err != nil || res != nil {
+		t.Fatalf("204 should yield (nil,nil), got res=%v err=%v", res, err)
+	}
+}
+
+func TestServeUnauthorized(t *testing.T) {
+	cases := map[int]string{
+		http.StatusUnauthorized: "device token invalid or revoked",
+		http.StatusForbidden:    "account suspended",
+	}
+	for code, wantReason := range cases {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(code)
+		}))
+		_, err := clientFor(srv.URL).Serve(context.Background())
+		srv.Close()
+		if !errors.Is(err, ErrUnauthorized) {
+			t.Errorf("status %d: err = %v, want ErrUnauthorized", code, err)
+		}
+		if got := UnauthorizedReason(err); got != wantReason {
+			t.Errorf("status %d: reason = %q, want %q", code, got, wantReason)
+		}
+	}
+}
+
+func TestServeServerErrorPropagates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	if _, err := clientFor(srv.URL).Serve(context.Background()); err == nil {
+		t.Fatal("expected error for 500")
+	}
+}
+
+func TestVerifyOKSendsDeviceMetadata(t *testing.T) {
+	var gotToken, gotPath, gotCLI, gotOS string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotToken = r.Header.Get("X-Device-Token")
+		gotPath = r.URL.Path
+		gotCLI = r.URL.Query().Get("cli")
+		gotOS = r.URL.Query().Get("os")
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}))
+	defer srv.Close()
+
+	err := clientFor(srv.URL).Verify(context.Background(), Meta{CLI: "claude-code", CLIVersion: "1.2.3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotToken != "dev-token" {
+		t.Errorf("device token header = %q", gotToken)
+	}
+	if gotPath != "/v1/token/verify" {
+		t.Errorf("path = %q", gotPath)
+	}
+	if gotCLI != "claude-code" {
+		t.Errorf("cli = %q", gotCLI)
+	}
+	if gotOS == "" {
+		t.Error("os query param should be set")
+	}
+}
+
+func TestVerifyUnauthorized(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	err := clientFor(srv.URL).Verify(context.Background(), Meta{CLI: "claude-code"})
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("err = %v, want ErrUnauthorized", err)
+	}
+}
+
+func TestPostImpressionSuccess(t *testing.T) {
+	for _, code := range []int{http.StatusOK, http.StatusCreated} {
+		var got Impression
+		var ct string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ct = r.Header.Get("Content-Type")
+			_ = decodeBody(r, &got)
+			w.WriteHeader(code)
+		}))
+		err := clientFor(srv.URL).PostImpression(context.Background(), Impression{
+			ImpressionToken: "tok", DisplayedMs: 2000, CLI: "claude-code",
+		})
+		srv.Close()
+		if err != nil {
+			t.Errorf("status %d: unexpected error %v", code, err)
+		}
+		if got.ImpressionToken != "tok" || got.DisplayedMs != 2000 || got.CLI != "claude-code" {
+			t.Errorf("status %d: body decoded wrong: %+v", code, got)
+		}
+		if ct != "application/json" {
+			t.Errorf("content-type = %q", ct)
+		}
+	}
+}
+
+func TestPostImpressionRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad token", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+	err := clientFor(srv.URL).PostImpression(context.Background(), Impression{ImpressionToken: "tok"})
+	if !errors.Is(err, ErrRejected) {
+		t.Errorf("err = %v, want ErrRejected", err)
+	}
+}
+
+func TestPostImpressionUnauthorized(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	err := clientFor(srv.URL).PostImpression(context.Background(), Impression{ImpressionToken: "tok"})
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("err = %v, want ErrUnauthorized", err)
+	}
+}
+
+func TestPostImpressionServerErrorPropagates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	err := clientFor(srv.URL).PostImpression(context.Background(), Impression{ImpressionToken: "tok"})
+	if err == nil || errors.Is(err, ErrRejected) || errors.Is(err, ErrUnauthorized) {
+		t.Errorf("err = %v, want a transient (propagating) error", err)
+	}
+}

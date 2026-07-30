@@ -1,0 +1,111 @@
+name: Publish prebuilt binaries
+
+# Cross-compiles the distribution binaries and attaches them to a GitHub Release
+# so installs work WITHOUT Go and WITHOUT committing binaries into the branch
+# (committing them used to cause dev<->main merge conflicts on the binary blobs
+# and the version bump). This workflow lives at the root of the public
+# VibePerks/claude-code repo, into which plugin/claude-code/ is mirrored by the
+# monorepo's push scripts. It is dormant inside the monorepo (only root-level
+# .github/workflows run there); the private monorepo never holds binaries.
+#
+# The release channel is derived from the ref this workflow is dispatched on:
+#   main -> the moving "latest" release (make_latest: true)
+#   dev  -> the moving "dev-latest" prerelease (prerelease: true)
+# The bin/vibeperks launcher (and bin/vibeperks.cmd on Windows) downloads the
+# matching binary on first use and caches it, so end users never build or commit.
+#
+# Versioning: CI owns the version, but only ONE branch ever WRITES it, so dev and
+# main never conflict on the version line:
+#   main -> bump the patch in .claude-plugin/plugin.json and commit it back to main
+#   dev  -> stamp a `<version>-dev.<run_number>` build WITHOUT committing anything
+# (The monorepo mirror pulls main's committed bump back via scripts/git-pull-main.ps1.)
+on:
+  # Dispatch-only: triggered by the monorepo CI/CD release job after every test
+  # gate passes, on the same ref (main or dev). Auto-trigger on push is off so an
+  # untested mirror push can never publish binaries.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Resolve version
+        run: |
+          set -eu
+          f=.claude-plugin/plugin.json
+          base=$(jq -r .version "$f")
+          if [ "${{ github.ref_name }}" = "dev" ]; then
+            # Dev: stamp a prerelease version but DO NOT commit. dev never writes the
+            # version line in a commit, so dev<->main never conflicts on it.
+            new="${base}-dev.${{ github.run_number }}"
+            jq --arg v "$new" '.version=$v' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+          else
+            # Main: bump the patch and commit it back (the single writer of the version).
+            IFS=. read -r a b c <<EOF
+          $base
+          EOF
+            new="$a.$b.$((c+1))"
+            jq --arg v "$new" '.version=$v' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+            git config user.name 'github-actions[bot]'
+            git config user.email 'github-actions[bot]@users.noreply.github.com'
+            git add "$f"
+            git commit -m "ci: bump version to $new [skip ci]"
+            git push origin HEAD:main
+          fi
+          echo "version -> $new"
+
+      - name: Cross-compile distribution binaries
+        run: DIST=1 sh ./build.sh
+
+      - name: Resolve release channel
+        id: channel
+        run: |
+          if [ "${{ github.ref_name }}" = "dev" ]; then
+            {
+              echo "tag=dev-latest"
+              echo "name=Dev build"
+              echo "prerelease=true"
+              echo "make_latest=false"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "tag=latest"
+              echo "name=Latest build"
+              echo "prerelease=false"
+              echo "make_latest=true"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      # Move the channel tag to THIS commit before publishing. softprops/action-gh-release
+      # refreshes an existing release's assets but never re-points an existing tag, which
+      # left the "latest"/"dev-latest" tag (and thus the release's displayed version and its
+      # auto-generated "Source code" archives) frozen at the commit where the tag was first
+      # created while the binaries were rebuilt. Force-moving the tag keeps the version
+      # text, source archives, and binary assets all pointing at the same commit.
+      - name: Move the "${{ steps.channel.outputs.tag }}" tag to this commit
+        run: |
+          git tag -f "${{ steps.channel.outputs.tag }}" HEAD
+          git push -f origin "refs/tags/${{ steps.channel.outputs.tag }}"
+
+      - name: Publish binaries to the "${{ steps.channel.outputs.tag }}" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.channel.outputs.tag }}
+          name: ${{ steps.channel.outputs.name }}
+          prerelease: ${{ steps.channel.outputs.prerelease }}
+          make_latest: ${{ steps.channel.outputs.make_latest }}
+          files: |
+            bin/vibeperks-darwin-amd64
+            bin/vibeperks-darwin-arm64
+            bin/vibeperks-linux-amd64
+            bin/vibeperks-linux-arm64
+            bin/vibeperks-windows-amd64.exe

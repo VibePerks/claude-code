@@ -1,0 +1,55 @@
+#!/bin/sh
+# VibePerks launcher invoked by the Claude Code hooks. A marketplace install ships
+# source + this script (no host binary), so we resolve a runnable binary at first use:
+#   1) a built/cached binary (bin/vibeperks.real)
+#   2) a prebuilt distribution binary for this platform (bin/vibeperks-<os>-<arch>)
+#   3) a prebuilt binary downloaded from the GitHub Release (cached as .real) - no Go needed
+#   4) build from src/ if Go is available (cached as bin/vibeperks.real)
+# Failures stay quiet so the host CLI is never broken.
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+bin="$root/bin"
+real="$bin/vibeperks.real"
+
+if [ -x "$real" ]; then exec "$real" "$@"; fi
+
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m)
+case "$arch" in x86_64|amd64) arch=amd64;; aarch64|arm64) arch=arm64;; esac
+case "$os" in darwin) os=darwin;; linux) os=linux;; mingw*|msys*|cygwin*) os=windows;; esac
+
+pre="$bin/vibeperks-$os-$arch"
+[ "$os" = windows ] && pre="$pre.exe"
+if [ -x "$pre" ]; then exec "$pre" "$@"; fi
+
+# Download the prebuilt binary for this platform from the GitHub Release, cache it
+# as bin/vibeperks.real, and run it - so a marketplace install works without Go.
+# Channel defaults to the moving "latest" release; set VIBEPERKS_RELEASE_CHANNEL=dev-latest
+# to pull the dev prerelease instead.
+channel="${VIBEPERKS_RELEASE_CHANNEL:-latest}"
+asset="vibeperks-$os-$arch"
+[ "$os" = windows ] && asset="$asset.exe"
+if [ "$channel" = latest ]; then
+  url="https://github.com/VibePerks/claude-code/releases/latest/download/$asset"
+else
+  url="https://github.com/VibePerks/claude-code/releases/download/$channel/$asset"
+fi
+tmp="$real.download.$$"
+if command -v curl >/dev/null 2>&1; then
+  if curl -fsSL "$url" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    chmod +x "$tmp" 2>/dev/null || true; mv "$tmp" "$real"; exec "$real" "$@"
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+elif command -v wget >/dev/null 2>&1; then
+  if wget -qO "$tmp" "$url" 2>/dev/null && [ -s "$tmp" ]; then
+    chmod +x "$tmp" 2>/dev/null || true; mv "$tmp" "$real"; exec "$real" "$@"
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+fi
+
+if command -v go >/dev/null 2>&1; then
+  ( cd "$root" && DIST=0 sh ./build.sh >/dev/null 2>&1 ) || exit 0
+  [ -x "$real" ] && exec "$real" "$@"
+fi
+exit 0
