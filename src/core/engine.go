@@ -16,15 +16,72 @@ type Meta struct {
 
 const defaultRotateSeconds = 20
 
-// billableIntervalSeconds paces serving to at most one new ad (one impression) every
-// 5 minutes while active, so a continuously busy session earns at most 12 ads/hour -
-// matching the backend's per-hour earning cap. Between serves the surface keeps the
-// cached ad; an idle session (no prompts) never serves.
-const billableIntervalSeconds = 300
+// defaultHourlyCap is the fallback when the serve response omits hourly_cap (older
+// backends). 3600 / 12 = 300s between rotations, matching the pre-cap-field default.
+const defaultHourlyCap = 12
 
-// earnCapNotice is the subtle line shown while an earning cap is in effect: no ad is
-// served until it resets, but the surface tells the publisher why.
-const earnCapNotice = "VibePerks: earning limit reached - more ads soon"
+// rotationIntervalSeconds returns the paced serve interval for a publisher: one ad
+// every (3600 / hourlyCap) seconds while active. Falls back to 300s (12/hour) when
+// no cap is known (fresh install, old backend).
+func rotationIntervalSeconds(s State) int {
+	cap := defaultHourlyCap
+	if s.Ad != nil && s.Ad.HourlyCap > 0 {
+		cap = s.Ad.HourlyCap
+	}
+	return 3600 / cap
+}
+
+// houseAdCopy maps the viewer's language to the localized house ad sentence shown
+// while earning-capped (mirrors _HOUSE_AD in the backend). Falls back to "en".
+var houseAdCopy = map[string]string{
+	"en": "Make your AI pay for itself",
+	"es": "Haz que tu IA se pague sola",
+}
+
+// cappedLine builds the earning-cap status line: the localized house ad sentence
+// followed by a "more ads in hh:mm" countdown computed from try_again_at (ISO-8601)
+// relative to now (Unix seconds). The countdown is a best-effort client-clock
+// approximation; the server is the authority on when the cap actually resets.
+func cappedLine(lang, tryAgainAt string, now int64) string {
+	copy := houseAdCopy[lang]
+	if copy == "" {
+		copy = houseAdCopy["en"]
+	}
+	t, err := time.Parse(time.RFC3339, tryAgainAt)
+	if err != nil {
+		return copy
+	}
+	remaining := t.Unix() - now
+	if remaining < 0 {
+		remaining = 0
+	}
+	h := remaining / 3600
+	m := (remaining % 3600) / 60
+	return copy + " \u2014 more ads in " + itoa(h) + "h " + pad2(m) + "m"
+}
+
+func itoa(n int64) string {
+	if n < 0 {
+		return "0"
+	}
+	// Simple integer-to-string for small positive numbers used in countdown format.
+	s := ""
+	if n == 0 {
+		return "0"
+	}
+	for n > 0 {
+		s = string(rune('0'+n%10)) + s
+		n /= 10
+	}
+	return s
+}
+
+func pad2(n int64) string {
+	if n < 10 {
+		return "0" + itoa(n)
+	}
+	return itoa(n)
+}
 
 func rotateSeconds(ad *Ad) int {
 	if ad != nil && ad.RotateSeconds > 0 {
@@ -75,16 +132,12 @@ func recordCurrent(dir string, s *State, meta Meta, now int64) error {
 	return nil
 }
 
-// Refresh is the thinking-start / rotation worker. It serves the next billable ad
-// only when there is no ad, or when at least billableIntervalSeconds have elapsed
-// since the last serve (so serving is paced to <=12/hour), recording the current
-// ad's impression first, then flushes the impression buffer. While an earning cap is
-// active it serves nothing until the reset time. The `force` argument is retained for
-// adapter compatibility but no longer forces a serve: pacing is purely time-based so
-// a burst of prompts cannot exceed the cap. Opt-out clears the cached ad and does no
-// network I/O.
-func Refresh(ctx context.Context, dir string, c *Client, meta Meta, now int64, force bool) error {
-	_ = force // pacing is time-based; a new prompt no longer forces an out-of-window serve
+// Refresh is the prompt / rotation worker. It serves the next billable ad only when
+// there is no ad, or when at least rotationIntervalSeconds have elapsed since the last
+// serve (paced to the publisher's hourly_cap), recording the current ad's impression
+// first, then flushes the impression buffer. While an earning cap is active it serves
+// nothing until the reset time. Opt-out clears the cached ad and does no network I/O.
+func Refresh(ctx context.Context, dir string, c *Client, meta Meta, now int64) error {
 	cfg, err := LoadConfig(dir)
 	if err != nil {
 		return err
@@ -100,7 +153,8 @@ func Refresh(ctx context.Context, dir string, c *Client, meta Meta, now int64, f
 	if capActive(s, now) {
 		return Flush(ctx, dir, c)
 	}
-	due := s.Ad == nil || now-s.ServedAt >= billableIntervalSeconds
+	interval := int64(rotationIntervalSeconds(s))
+	due := s.Ad == nil || now-s.ServedAt >= interval
 	if !due {
 		return Flush(ctx, dir, c)
 	}
@@ -126,9 +180,11 @@ func Refresh(ctx context.Context, dir string, c *Client, meta Meta, now int64, f
 	case result == nil || (result.Ad == nil && result.TryAgainAt == ""):
 		s = State{} // empty inventory: clear the slot
 	case result.TryAgainAt != "":
-		s = State{TryAgainAt: result.TryAgainAt} // earning-capped: no ad, back off until reset
+		// Earning-capped: store the reset time and language so Render can show the
+		// house ad + countdown instead of a blank slot.
+		s = State{TryAgainAt: result.TryAgainAt, Lang: result.Lang}
 	default:
-		s = State{Ad: result.Ad, ServedAt: now}
+		s = State{Ad: result.Ad, ServedAt: now, Lang: result.Lang}
 	}
 	if err := SaveState(dir, s); err != nil {
 		return err
@@ -151,9 +207,10 @@ func Render(dir string, now int64, loginCmd string) (string, string, string, boo
 		return LoginNotice(loginCmd, s.NeedsLoginReason), "", "", true, nil
 	}
 	if s.Ad == nil {
-		// Earning cap active: show a subtle paused notice instead of an ad.
+		// Earning cap active: show the house ad sentence + "more ads in hh:mm"
+		// countdown so the publisher knows earning will resume and when.
 		if capActive(s, now) {
-			return earnCapNotice, "", "", false, nil
+			return cappedLine(s.Lang, s.TryAgainAt, now), "", "", false, nil
 		}
 		return "", "", "", false, nil
 	}
