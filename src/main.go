@@ -120,7 +120,7 @@ func cmdRefresh(dir string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return core.Refresh(ctx, dir, core.NewClient(cfg), meta(sessionID), time.Now().Unix(), true)
+	return core.Refresh(ctx, dir, core.NewClient(cfg), meta(sessionID), time.Now().Unix())
 }
 
 // cmdStop (Stop) signals thinking-end: record the current ad's impression and flush.

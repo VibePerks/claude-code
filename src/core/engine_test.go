@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,7 +63,7 @@ func TestRefreshOptOutClearsStateNoNetwork(t *testing.T) {
 	m := newEngineMock(&Ad{AdID: "new"})
 	defer m.close()
 
-	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100, true); err != nil {
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100); err != nil {
 		t.Fatal(err)
 	}
 	if m.serveCalls.Load() != 0 || m.impCalls.Load() != 0 {
@@ -80,7 +81,7 @@ func TestRefreshForceServesAndCaches(t *testing.T) {
 	m := newEngineMock(ad)
 	defer m.close()
 
-	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100, true); err != nil {
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100); err != nil {
 		t.Fatal(err)
 	}
 	if m.serveCalls.Load() != 1 {
@@ -99,7 +100,7 @@ func TestRefreshForce204ClearsAd(t *testing.T) {
 	defer m.close()
 
 	// Past the 5-minute billable window so a serve is due.
-	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 400, true); err != nil {
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 400); err != nil {
 		t.Fatal(err)
 	}
 	s, _ := LoadState(dir)
@@ -114,8 +115,8 @@ func TestRefreshNotDueDoesNotServe(t *testing.T) {
 	m := newEngineMock(&Ad{AdID: "b"})
 	defer m.close()
 
-	// now only 5s after serve, no force => not due
-	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 105, false); err != nil {
+	// now only 5s after serve => not due
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 105); err != nil {
 		t.Fatal(err)
 	}
 	if m.serveCalls.Load() != 0 {
@@ -138,8 +139,8 @@ func TestRefreshRotatesAfterBillableWindow(t *testing.T) {
 	m := newEngineMock(&Ad{AdID: "b", ImpressionToken: "tokB", RotateSeconds: 20})
 	defer m.close()
 
-	// 5+ minutes after serve, rendered => due (a new billable serve).
-	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100+billableIntervalSeconds+10, false); err != nil {
+	// 5+ minutes after serve, rendered => due (a new billable serve). 300s = default rotation.
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 410); err != nil {
 		t.Fatal(err)
 	}
 	if m.serveCalls.Load() != 1 {
@@ -159,13 +160,13 @@ func TestRefreshRotatesAfterBillableWindow(t *testing.T) {
 
 func TestRefreshEarningCappedBacksOff(t *testing.T) {
 	dir := t.TempDir()
-	resetAt := time.Unix(100+billableIntervalSeconds, 0).UTC().Format(time.RFC3339)
+	resetAt := time.Unix(100+300, 0).UTC().Format(time.RFC3339)
 	m := newEngineMock(&Ad{AdID: "b", ImpressionToken: "tokB"})
 	m.serveCap = resetAt // the next serve reports the publisher is earning-capped
 	defer m.close()
 
 	// First serve returns earning_capped: no ad, cache the reset time.
-	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100, true); err != nil {
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100; err != nil {
 		t.Fatal(err)
 	}
 	if m.serveCalls.Load() != 1 {
@@ -177,7 +178,7 @@ func TestRefreshEarningCappedBacksOff(t *testing.T) {
 	}
 
 	// While within the backoff window, Refresh must NOT call serve again.
-	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 150, true); err != nil {
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 150; err != nil {
 		t.Fatal(err)
 	}
 	if m.serveCalls.Load() != 1 {
@@ -186,7 +187,7 @@ func TestRefreshEarningCappedBacksOff(t *testing.T) {
 
 	// After the reset time, serving resumes and the cap clears.
 	m.serveCap = ""
-	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100+billableIntervalSeconds+5, true); err != nil {
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100+300+5; err != nil {
 		t.Fatal(err)
 	}
 	if m.serveCalls.Load() != 2 {
@@ -205,7 +206,7 @@ func TestRefreshUnrenderedAdSkipsImpression(t *testing.T) {
 	m := newEngineMock(&Ad{AdID: "b", ImpressionToken: "tokB"})
 	defer m.close()
 
-	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100+billableIntervalSeconds+10, true); err != nil {
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 100+300+10; err != nil {
 		t.Fatal(err)
 	}
 	if m.impCalls.Load() != 0 {
@@ -227,7 +228,7 @@ func TestRefreshServeErrorPropagatesAndKeepsImpression(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := Refresh(context.Background(), dir, clientFor(srv.URL), newMeta(), 100+billableIntervalSeconds+10, true)
+	err := Refresh(context.Background(), dir, clientFor(srv.URL), newMeta(), 100+300+10
 	if err == nil {
 		t.Fatal("serve error should propagate")
 	}
@@ -251,7 +252,7 @@ func TestRefreshUnauthorizedFlagsNeedsLogin(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := Refresh(context.Background(), dir, clientFor(srv.URL), newMeta(), 100+billableIntervalSeconds+10, true)
+	err := Refresh(context.Background(), dir, clientFor(srv.URL), newMeta(), 100+300+10
 	if !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expected ErrUnauthorized, got %v", err)
 	}
@@ -311,15 +312,23 @@ func TestRenderNoAd(t *testing.T) {
 func TestRenderEarningCappedShowsNotice(t *testing.T) {
 	dir := t.TempDir()
 	resetAt := time.Unix(500, 0).UTC().Format(time.RFC3339)
-	_ = SaveState(dir, State{TryAgainAt: resetAt})
+	_ = SaveState(dir, State{TryAgainAt: resetAt, Lang: "en"})
 
-	// Before the reset time: a subtle paused notice (not a login notice, no ad).
+	// Before the reset time: the house ad sentence + countdown (not a login notice, no ad).
 	line, domain, websiteURL, notice, err := Render(dir, 100, "vibeperks login")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if line != earnCapNotice || notice || domain != "" || websiteURL != "" {
+	if line == "" || notice || domain != "" || websiteURL != "" {
 		t.Errorf("capped render wrong: line=%q notice=%v domain=%q url=%q", line, notice, domain, websiteURL)
+	}
+	// Must contain the house ad sentence.
+	if !strings.Contains(line, "Make your AI pay for itself") {
+		t.Errorf("capped line should contain house ad, got %q", line)
+	}
+	// Must contain the countdown.
+	if !strings.Contains(line, "more ads in") {
+		t.Errorf("capped line should contain countdown, got %q", line)
 	}
 
 	// After the reset time: no notice, nothing shown (the cap has lapsed).
@@ -422,7 +431,7 @@ func TestRefreshNotDueFlushesPendingQueue(t *testing.T) {
 	m := newEngineMock(&Ad{AdID: "b"})
 	defer m.close()
 
-	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 105, false); err != nil {
+	if err := Refresh(context.Background(), dir, m.client(), newMeta(), 105; err != nil {
 		t.Fatal(err)
 	}
 	if m.serveCalls.Load() != 0 {

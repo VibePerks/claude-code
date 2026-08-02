@@ -134,13 +134,18 @@ func (c *Client) Serve(ctx context.Context) (*ServeResult, error) {
 			return nil, err
 		}
 		if payload.Status == "earning_capped" {
-			return &ServeResult{TryAgainAt: payload.TryAgainAt}, nil
+			return &ServeResult{
+				TryAgainAt: payload.TryAgainAt,
+				HourlyCap:  payload.HourlyCap,
+				DailyCap:   payload.DailyCap,
+				Lang:       payload.Lang,
+			}, nil
 		}
 		ad := payload.Ad
 		ad.Sentence = SanitizeAd(ad.Sentence)
 		ad.Domain = SanitizeAd(ad.Domain)
 		ad.WebsiteURL = SanitizeAd(ad.WebsiteURL)
-		return &ServeResult{Ad: &ad}, nil
+		return &ServeResult{Ad: &ad, HourlyCap: ad.HourlyCap, DailyCap: ad.DailyCap, Lang: ad.Lang}, nil
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return nil, &AuthRejection{Reason: authReason(resp.StatusCode)}
 	default:

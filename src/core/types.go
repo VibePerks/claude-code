@@ -12,15 +12,25 @@ type Ad struct {
 	WebsiteURL      string `json:"website_url"`
 	ImpressionToken string `json:"impression_token"`
 	RotateSeconds   int    `json:"rotate_seconds"`
+	// The viewer's language (en/es) the ad sentence was rendered in.
+	Lang string `json:"lang"`
+	// The effective hourly/daily earning caps for this publisher (server-authoritative,
+	// KYC-aware). The client uses HourlyCap to pace rotation: 3600 / HourlyCap
+	// seconds between serves. Zero when the backend omits them (old backends).
+	HourlyCap int `json:"hourly_cap"`
+	DailyCap  int `json:"daily_cap"`
 }
 
 // ServeResult is what Serve returns: an Ad to show, or an earning-capped signal
-// (TryAgainAt set, Ad nil) when the publisher has hit their hourly/daily earning
-// limit, so the caller stops serving until that time. A nil *ServeResult means empty
-// inventory (a 204).
+// (TryAgainAt set, Ad nil, HourlyCap/DailyCap/Lang populated) when the publisher has
+// hit their hourly/daily earning limit, so the caller stops serving until that time.
+// A nil *ServeResult means empty inventory (a 204).
 type ServeResult struct {
 	Ad         *Ad
 	TryAgainAt string
+	HourlyCap  int
+	DailyCap   int
+	Lang       string
 }
 
 // Impression is the payload posted to POST /v1/impressions. Money/credit is decided

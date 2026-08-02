@@ -25,6 +25,9 @@ type State struct {
 	// TryAgainAt is the ISO-8601 UTC time an active earning-cap resets. While it is in
 	// the future the slot shows no ad and serving is paused until then.
 	TryAgainAt string `json:"try_again_at,omitempty"`
+	// Lang is the viewer's language (en/es) from the last serve response, used to
+	// localize the house ad copy shown while earning-capped.
+	Lang string `json:"lang,omitempty"`
 }
 
 func statePath(dir string) string { return filepath.Join(dir, "state.json") }
